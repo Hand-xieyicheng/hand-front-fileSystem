@@ -6,6 +6,17 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 9000;
 
+// 添加跨域支持
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  next();
+});
+
 // 确保public文件夹存在
 const publicDir = path.join(__dirname, 'public');
 if (!fs.existsSync(publicDir)) {
@@ -15,44 +26,82 @@ if (!fs.existsSync(publicDir)) {
 // 设置文件存储配置
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    // 使用自定义的方式从formData中获取folder参数
-    // 在Multer中，req.body会包含除了文件字段之外的其他字段
-    let folder = '';
-    if (req.body && req.body.folder) {
-      folder = req.body.folder;
+    // 从formData或query参数中获取dir参数
+    let dir = '';
+    if (req.body && req.body.dir) {
+      dir = req.body.dir;
     }
-    // 也支持通过query参数传递folder
-    if (!folder && req.query && req.query.folder) {
-      folder = req.query.folder;
+    // 也支持通过query参数传递dir
+    if (!dir && req.query && req.query.dir) {
+      dir = req.query.dir;
     }
-    const uploadDir = path.join(publicDir, folder);
     
-    // 确保上传目录存在
+    // 标准化处理dir路径：去除首尾多余的斜杠
+    const cleanDir = dir ? dir.trim().replace(/^\/+/, '').replace(/\/+$/, '') : '';
+    // 拼接最终的上传目录
+    const uploadDir = path.join(publicDir, cleanDir);
+    
+    // 确保上传目录存在（recursive: true 自动创建多级目录）
     fs.mkdirSync(uploadDir, { recursive: true });
     cb(null, uploadDir);
   },
   filename: function (req, file, cb) {
-    // 使用自定义的方式从formData中获取folder参数
-    let folder = '';
-    if (req.body && req.body.folder) {
-      folder = req.body.folder;
+    // 获取dir参数
+    let dir = '';
+    if (req.body && req.body.dir) {
+      dir = req.body.dir;
     }
-    if (!folder && req.query && req.query.folder) {
-      folder = req.query.folder;
+    if (!dir && req.query && req.query.dir) {
+      dir = req.query.dir;
     }
-    const uploadDir = path.join(publicDir, folder);
+    // 标准化dir路径
+    const cleanDir = dir ? dir.trim().replace(/^\/+/, '').replace(/\/+$/, '') : '';
+    const uploadDir = path.join(publicDir, cleanDir);
+    
+    // 1. 获取前端传递的fileName参数
+    let customFileName = '';
+    if (req.body && req.body.fileName) {
+      customFileName = req.body.fileName.trim();
+    }
+    if (!customFileName && req.query && req.query.fileName) {
+      customFileName = req.query.fileName.trim();
+    }
+    
     const originalName = file.originalname;
-    const fileExt = path.extname(originalName);
-    const fileNameWithoutExt = path.basename(originalName, fileExt);
+    const fileExt = path.extname(originalName); // 获取原文件扩展名
     
-    // 检查文件名是否已存在，避免重复
-    let finalName = originalName;
+    let finalName;
+    let fileNameWithoutExt;
+    
+    // 2. 判断是否使用自定义文件名
+    if (customFileName) {
+      // 检查自定义文件名是否包含扩展名
+      const customExt = path.extname(customFileName);
+      if (customExt) {
+        // 如果自定义文件名带扩展名，直接使用
+        fileNameWithoutExt = path.basename(customFileName, customExt);
+        finalName = customFileName;
+      } else {
+        // 如果自定义文件名不带扩展名，拼接原文件扩展名
+        fileNameWithoutExt = customFileName;
+        finalName = `${customFileName}${fileExt}`;
+      }
+    } else {
+      // 没有自定义文件名，使用原文件名
+      fileNameWithoutExt = path.basename(originalName, fileExt);
+      finalName = originalName;
+    }
+    
+    // 3. 检查文件名是否已存在，避免重复（无论是否自定义文件名都要检查）
     let counter = 1;
-    
-    while (fs.existsSync(path.join(uploadDir, finalName))) {
-      finalName = `${fileNameWithoutExt}_${counter}${fileExt}`;
+    let tempName = finalName;
+    while (fs.existsSync(path.join(uploadDir, tempName))) {
+      const ext = path.extname(finalName);
+      const nameWithoutExt = path.basename(finalName, ext);
+      tempName = `${nameWithoutExt}_${counter}${ext}`;
       counter++;
     }
+    finalName = tempName;
     
     cb(null, finalName);
   }
@@ -71,19 +120,23 @@ app.post('/upload', upload.single('file'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded.' });
   }
+
+  const { dir, fileName } = req.body;
+  // 标准化dir路径
+  const cleanDir = dir ? dir.trim().replace(/^\/+/, '').replace(/\/+$/, '') : '';
   
-  // 获取实际的相对路径
-  const relativePath = req.file.path.replace(publicDir, '').replace(/^\//, '');
-  const folder = relativePath.includes('/') ? relativePath.substring(0, relativePath.lastIndexOf('/')) : '';
-  const fileUrl = `${req.protocol}://${req.get('host')}/${relativePath}`;
+  // 重新计算相对路径（适配动态目录）
+  let relativePath = req.file.path.replace(publicDir, '').replace(/^\//, '');
   
   res.status(200).json({
     message: 'File uploaded successfully!',
-    filename: req.file.filename,
-    folder: folder,
-    path: req.file.path,
-    relativePath: relativePath,
-    url: fileUrl
+    filename: req.file.filename, // 最终保存的文件名
+    customFileName: fileName || '', // 前端传递的自定义文件名
+    folder: cleanDir, // 返回标准化后的dir路径
+    path: req.file.path, // 本地绝对路径
+    relativePath: relativePath, // 相对于public的路径
+    url: '/' +`${relativePath}`, // 可直接访问的URL
+    dir: dir || '' // 返回前端传递的原始dir参数
   });
 });
 
